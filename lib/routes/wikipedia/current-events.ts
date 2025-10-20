@@ -237,6 +237,46 @@ export function wikiToHtml(wikitext: string): string {
     return html;
 }
 
+export function parseDateRange(dateRange: string): Date[] | null {
+    if (!dateRange || typeof dateRange !== 'string') {
+        return null;
+    }
+
+    const parts = dateRange.split(':');
+
+    if (parts.length === 1) {
+        const date = new Date(parts[0]);
+        if (Number.isNaN(date.getTime())) {
+            return null;
+        }
+        return [date];
+    }
+
+    if (parts.length === 2) {
+        const startDate = new Date(parts[0]);
+        const endDate = new Date(parts[1]);
+
+        if (Number.isNaN(startDate.getTime()) || Number.isNaN(endDate.getTime())) {
+            return null;
+        }
+
+        const actualStart = new Date(Math.min(startDate.getTime(), endDate.getTime()));
+        const actualEnd = new Date(Math.max(startDate.getTime(), endDate.getTime()));
+
+        const dates: Date[] = [];
+        const currentDate = new Date(actualEnd);
+
+        while (currentDate >= actualStart) {
+            dates.push(new Date(currentDate));
+            currentDate.setDate(currentDate.getDate() - 1);
+        }
+
+        return dates;
+    }
+
+    return null;
+}
+
 async function fetchMultipleWikiContent(pageNames: string[]): Promise<Record<string, string>> {
     const url = 'https://en.wikipedia.org/w/api.php';
     const titles = pageNames.join('|');
@@ -300,12 +340,16 @@ async function fetchMultipleWikiContent(pageNames: string[]): Promise<Record<str
 }
 
 export const route: Route = {
-    path: '/current-events/:includeToday?',
+    path: '/current-events/:dateRange?/:includeToday?',
     categories: ['new-media'],
     example: '/wikipedia/current-events',
     parameters: {
+        dateRange: {
+            description: 'Date range in YYYY-MM-DD format. Can be a single date (e.g., "2025-01-15") or a range with colon separator (e.g., "2025-01-15:2025-01-20"). If omitted, defaults to last 7 days behavior.',
+            default: '',
+        },
         includeToday: {
-            description: 'Include current day events (may be incomplete early in the day)',
+            description: 'Include current day events (only used when dateRange is not specified)',
             default: 'auto',
             options: [
                 {
@@ -344,14 +388,24 @@ export const route: Route = {
     name: 'Current Events',
     maintainers: ['aavanian'],
     handler,
-    description: 'Wikipedia Portal: Current events - Latest news and events from the past 7 days',
+    description: 'Wikipedia Portal: Current events - Latest news and events. By default shows the past 7 days, or specify a custom date range.',
 };
 
 async function handler(ctx) {
+    const dateRangeParam = ctx.req.param('dateRange');
     const includeToday = ctx.req.param('includeToday') ?? 'auto';
 
-    // Determine if we should include today's events
-    const dates = determineDates(includeToday);
+    let dates: Date[];
+
+    if (dateRangeParam) {
+        const parsedDates = parseDateRange(dateRangeParam);
+        if (!parsedDates) {
+            throw new Error(`Invalid date range format: ${dateRangeParam}. Expected single date (YYYY-MM-DD) or range (YYYY-MM-DD:YYYY-MM-DD)`);
+        }
+        dates = parsedDates;
+    } else {
+        dates = determineDates(includeToday);
+    }
 
     // Create array of page names for batch request
     const pageNames = dates.map((date) => getCurrentEventsDatePath(date));

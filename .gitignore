@@ -42,3 +42,6 @@ yarn.lock
 yarn-error.log
 
 dist-container
+
+# Local-only route tests, not accepted upstream
+*.local.test.ts

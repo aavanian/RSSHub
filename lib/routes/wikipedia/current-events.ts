@@ -59,22 +59,34 @@ function getCurrentEventsDatePath(date: Date): string {
 const TOP_TEMPLATE = /\{\{\s*Current events\s*\|[^{}]*\btop\s*=\s*yes[^{}]*\}\}/i;
 const BOTTOM_TEMPLATE = /\{\{\s*Current events\s*\|[^{}]*\bbottom\s*=\s*yes[^{}]*\}\}/i;
 
+// Pages created before 2026-08-01 pass the items as the template's `content=` argument, closed by a
+// trailing }}. Days that far back are only reachable through dateRange, so this arm exists for backfill.
+// The (?=(\s*=))\1 dance around the `=` keeps \s* from overlapping the following [\s\S]*, which would
+// otherwise backtrack super-linearly; see regexp(no-super-linear-backtracking).
+const LEGACY_CONTENT_TEMPLATE = /\{\{Current events\s*\|[\s\S]*?content(?=(\s*=))\1\s*((?:\S[\s\S]*)?)\}\}$/;
+
 // Simple MediaWiki template parser for {{Current events}} template
 function parseCurrentEventsTemplate(wikitext: string): string | null {
     if (!wikitext) {
         return null;
     }
 
+    let content: string;
+
     const top = wikitext.match(TOP_TEMPLATE);
-    if (!top) {
-        return null;
-    }
+    if (top) {
+        content = wikitext.slice(top.index! + top[0].length);
 
-    let content = wikitext.slice(top.index! + top[0].length);
-
-    const bottom = content.match(BOTTOM_TEMPLATE);
-    if (bottom) {
-        content = content.slice(0, bottom.index);
+        const bottom = content.match(BOTTOM_TEMPLATE);
+        if (bottom) {
+            content = content.slice(0, bottom.index);
+        }
+    } else {
+        const legacy = wikitext.match(LEGACY_CONTENT_TEMPLATE);
+        if (!legacy) {
+            return null;
+        }
+        content = legacy[2];
     }
 
     content = content.trim();
@@ -277,7 +289,75 @@ export function wikiToHtml(wikitext: string): string {
     return html;
 }
 
+// Midnight local time, matching the local getters in getCurrentEventsDatePath. new Date('YYYY-MM-DD')
+// would give midnight UTC, which is the previous calendar day anywhere west of UTC.
+function parseLocalDay(value: string): Date | null {
+    const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
+    if (!match) {
+        return null;
+    }
+
+    const [year, month, day] = match.slice(1).map(Number);
+    const date = new Date(year, month - 1, day);
+
+    // Rejects out-of-range days such as 2025-02-30, which Date would roll over into March
+    return date.getMonth() === month - 1 && date.getDate() === day ? date : null;
+}
+
+export function parseDateRange(dateRange: string): Date[] | null {
+    if (!dateRange || typeof dateRange !== 'string') {
+        return null;
+    }
+
+    const parts = dateRange.split(':');
+
+    if (parts.length === 1) {
+        const date = parseLocalDay(parts[0]);
+        return date ? [date] : null;
+    }
+
+    if (parts.length === 2) {
+        const startDate = parseLocalDay(parts[0]);
+        const endDate = parseLocalDay(parts[1]);
+
+        if (!startDate || !endDate) {
+            return null;
+        }
+
+        const actualStart = new Date(Math.min(startDate.getTime(), endDate.getTime()));
+        const actualEnd = new Date(Math.max(startDate.getTime(), endDate.getTime()));
+
+        const dates: Date[] = [];
+        const currentDate = new Date(actualEnd);
+
+        while (currentDate >= actualStart) {
+            dates.push(new Date(currentDate));
+            currentDate.setDate(currentDate.getDate() - 1);
+        }
+
+        return dates;
+    }
+
+    return null;
+}
+
+// The API accepts at most 50 titles per query for unauthenticated clients, and a wide dateRange
+// backfill asks for far more than that.
+const MAX_TITLES_PER_REQUEST = 50;
+
 async function fetchMultipleWikiContent(pageNames: string[]): Promise<Record<string, string>> {
+    const results: Record<string, string> = {};
+
+    for (let i = 0; i < pageNames.length; i += MAX_TITLES_PER_REQUEST) {
+        const batch = pageNames.slice(i, i + MAX_TITLES_PER_REQUEST);
+        // eslint-disable-next-line no-await-in-loop
+        Object.assign(results, await fetchWikiContentBatch(batch));
+    }
+
+    return results;
+}
+
+async function fetchWikiContentBatch(pageNames: string[]): Promise<Record<string, string>> {
     const url = 'https://en.wikipedia.org/w/api.php';
     const titles = pageNames.join('|');
     const results: Record<string, string> = {};
@@ -343,12 +423,16 @@ async function fetchMultipleWikiContent(pageNames: string[]): Promise<Record<str
 }
 
 export const route: Route = {
-    path: '/current-events/:includeToday?',
+    path: '/current-events/:dateRange?/:includeToday?',
     categories: ['new-media'],
     example: '/wikipedia/current-events',
     parameters: {
+        dateRange: {
+            description: 'Date range in YYYY-MM-DD format. Can be a single date (e.g., "2025-01-15") or a range with colon separator (e.g., "2025-01-15:2025-01-20"). If omitted, defaults to last 7 days behavior.',
+            default: '',
+        },
         includeToday: {
-            description: 'Include current day events (may be incomplete early in the day)',
+            description: 'Include current day events (only used when dateRange is not specified)',
             default: 'auto',
             options: [
                 {
@@ -387,14 +471,24 @@ export const route: Route = {
     name: 'Current Events',
     maintainers: ['aavanian'],
     handler,
-    description: 'Wikipedia Portal: Current events - Latest news and events from the past 7 days',
+    description: 'Wikipedia Portal: Current events - Latest news and events. By default shows the past 7 days, or specify a custom date range.',
 };
 
 async function handler(ctx) {
+    const dateRangeParam = ctx.req.param('dateRange');
     const includeToday = ctx.req.param('includeToday') ?? 'auto';
 
-    // Determine if we should include today's events
-    const dates = determineDates(includeToday);
+    let dates: Date[];
+
+    if (dateRangeParam) {
+        const parsedDates = parseDateRange(dateRangeParam);
+        if (!parsedDates) {
+            throw new InvalidParameterError(`Invalid date range format: ${dateRangeParam}. Expected single date (YYYY-MM-DD) or range (YYYY-MM-DD:YYYY-MM-DD)`);
+        }
+        dates = parsedDates;
+    } else {
+        dates = determineDates(includeToday);
+    }
 
     // Create array of page names for batch request
     const pageNames = dates.map((date) => getCurrentEventsDatePath(date));

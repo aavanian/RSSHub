@@ -1,3 +1,4 @@
+import { decodeXML } from 'entities';
 import sanitizeHtml from 'sanitize-html';
 
 import { config } from '@/config';
@@ -78,8 +79,8 @@ function parseCurrentEventsTemplate(wikitext: string): string | null {
 
     content = content.trim();
 
-    // Strip comments to detect empty content
-    content = stripComments(content);
+    // Strip comments and unsafe tags to detect empty content
+    content = sanitizeHtml(content);
 
     // Check if content is empty or only contains empty bullets (e.g., "*", "**", with whitespace)
     if (/^\s*\*+\s*$/.test(content)) {
@@ -95,17 +96,41 @@ function stripTemplates(wikitext: string): string {
     return wikitext.replaceAll(/\{\{([^}]+)\}\}/g, '$1');
 }
 
+// Link targets come from the wikitext, so they are attacker-controlled and land in an href
+// attribute. sanitizeHtml runs on the wikitext before any tag is built and re-escapes a literal
+// &/</> in text into &amp;/&lt;/&gt;; decodeXML reverses that before encodeURI percent-encodes the
+// " that would otherwise close the attribute (sanitizeHtml does not escape it in plain text) and
+// fixes the spaces that made the URLs invalid.
+function wikiUrl(target: string): string {
+    // trim() covers literal leading/trailing whitespace typed around the target itself, e.g.
+    // "[[ Page |Text]]" — not entity-derived whitespace, which sanitizeHtml already resolves
+    // before this function ever sees the string.
+    return `https://en.wikipedia.org/wiki/${encodeURI(decodeXML(target).trim().replaceAll(' ', '_'))}`;
+}
+
+// Anything that is not http(s) — javascript:, data: — is left as plain text rather than linked.
+function externalUrl(url: string): string | null {
+    const decoded = decodeXML(url);
+    return /^https?:\/\//i.test(decoded) ? encodeURI(decoded) : null;
+}
+
 function convertWikiLinks(html: string): string {
     // Convert wiki links [[Link|Text]] or [[Link]]
-    html = html.replaceAll(/\[\[([^|\]]+)\|([^\]]+)\]\]/g, '<a href="https://en.wikipedia.org/wiki/$1">$2</a>');
-    html = html.replaceAll(/\[\[([^\]]+)\]\]/g, '<a href="https://en.wikipedia.org/wiki/$1">$1</a>');
+    html = html.replaceAll(/\[\[([^|\]]+)\|([^\]]+)\]\]/g, (_match, target: string, text: string) => `<a href="${wikiUrl(target)}">${text}</a>`);
+    html = html.replaceAll(/\[\[([^\]]+)\]\]/g, (_match, target: string) => `<a href="${wikiUrl(target)}">${target}</a>`);
     return html;
 }
 
 function convertExternalLinks(html: string): string {
-    // Convert external links [URL Text] or [URL]
-    html = html.replaceAll(/\[([^\s\]]+)\s+([^\s\]][^\]]*|\s)\]/g, '<a href="$1">$2</a>');
-    html = html.replaceAll(/\[([^\s\]]+)\]/g, '<a href="$1">$1</a>');
+    // Convert external links [URL Text] or [URL], leaving non-http(s) ones as the original text
+    html = html.replaceAll(/\[([^\s\]]+)\s+([^\s\]][^\]]*|\s)\]/g, (match, url: string, text: string) => {
+        const href = externalUrl(url);
+        return href ? `<a href="${href}">${text}</a>` : match;
+    });
+    html = html.replaceAll(/\[([^\s\]]+)\]/g, (match, url: string) => {
+        const href = externalUrl(url);
+        return href ? `<a href="${href}">${url}</a>` : match;
+    });
     return html;
 }
 
@@ -236,11 +261,6 @@ function processListsAndLines(html: string): string {
 
     closeAllOpenLists(state);
     return state.result.join('\n');
-}
-
-function stripComments(html: string): string {
-    // Remove HTML comments and unsafe tags
-    return sanitizeHtml(html);
 }
 
 // Wiki markup to HTML converter with proper list handling

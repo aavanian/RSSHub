@@ -7,8 +7,6 @@ import InvalidParameterError from '@/errors/types/invalid-parameter';
 import type { Route } from '@/types';
 import cache from '@/utils/cache';
 import got from '@/utils/got';
-import { parseDate } from '@/utils/parse-date';
-import timezone from '@/utils/timezone';
 
 // Query the seven daily revisions to retain the existing empty-day selection.
 // Render each published day through the official API so templates and links
@@ -50,12 +48,12 @@ function parseCurrentEventsTemplate(wikitext: string): string | null {
 function stripComments(html: string): string {
     return sanitizeHtml(html);
 }
-async function getRenderedWikiContent(pageName: string): Promise<string> {
+async function getRenderedWikiContent(pageName: string, revid: number): Promise<string> {
     const { data } = await got('https://en.wikipedia.org/w/api.php', {
         searchParams: {
             action: 'parse',
             format: 'json',
-            page: pageName,
+            oldid: revid,
             prop: 'text',
             disableeditsection: true,
             disabletoc: true,
@@ -88,7 +86,7 @@ async function getRenderedWikiContent(pageName: string): Promise<string> {
 async function fetchMultipleWikiContent(pageNames: string[]): Promise<Record<string, string>> {
     const url = 'https://en.wikipedia.org/w/api.php';
     const titles = pageNames.join('|');
-    const publishedPages = new Set<string>();
+    const publishedPages = new Map<string, number>();
     let continueParams: Record<string, string> = {};
     let hasMore = true;
     while (hasMore) {
@@ -97,7 +95,7 @@ async function fetchMultipleWikiContent(pageNames: string[]): Promise<Record<str
             format: 'json',
             titles,
             prop: 'revisions',
-            rvprop: 'content',
+            rvprop: 'ids|content',
             rvslots: 'main',
             ...continueParams,
         };
@@ -113,6 +111,7 @@ async function fetchMultipleWikiContent(pageNames: string[]): Promise<Record<str
             const streamLines = Object.values<{
                 title: string;
                 revisions: Array<{
+                    revid: number;
                     slots: {
                         main: Record<string, string>;
                     };
@@ -132,7 +131,7 @@ async function fetchMultipleWikiContent(pageNames: string[]): Promise<Record<str
                 const pageTitle = page.title;
                 // Convert back to the format we expect: "Portal:Current_events/2025_September_18"
                 const normalizedTitle = pageTitle.replace(/Portal:Current events\/(\d{4}) (\w+) (\d+)/, 'Portal:Current_events/$1_$2_$3');
-                publishedPages.add(normalizedTitle);
+                publishedPages.set(normalizedTitle, page.revisions[0].revid);
             }
         }
         // Check for continuation
@@ -142,11 +141,17 @@ async function fetchMultipleWikiContent(pageNames: string[]): Promise<Record<str
             hasMore = false;
         }
     }
+    // Days keep being edited well after they end, so the rendered HTML is keyed by revision: an edit
+    // yields a new key instead of serving a version cached before it.
     const results = await unwrapFirstFailure(
-        pMap(publishedPages, async (pageName) => [pageName, await cache.tryGet(`wikipedia:current-events:article:${pageName}`, async () => await getRenderedWikiContent(pageName), config.cache.contentExpire)] as const, {
-            concurrency: 3,
-            stopOnError: false,
-        })
+        pMap(
+            publishedPages,
+            async ([pageName, revid]) => [pageName, await cache.tryGet(`wikipedia:current-events:article:${pageName}:${revid}`, async () => await getRenderedWikiContent(pageName, revid), config.cache.contentExpire)] as const,
+            {
+                concurrency: 3,
+                stopOnError: false,
+            }
+        )
     );
     return Object.fromEntries(results);
 }
@@ -156,7 +161,8 @@ export const route: Route = {
     example: '/wikipedia/current-events',
     parameters: {
         includeToday: {
-            description: 'Include current day events (may be incomplete early in the day)',
+            description:
+                'Hours after a day starts (00:00 UTC) before it enters the feed, also used as its pubDate. A day keeps changing until it ends at GMT-12, 36 hours after it starts, and most readers keep the first version they see.',
             default: 'auto',
             options: [
                 {
@@ -172,8 +178,8 @@ export const route: Route = {
                     value: 'never',
                 },
                 {
-                    label: 'Include after specific UTC hour (0-23)',
-                    value: '0-23',
+                    label: 'Include after a delay in hours (0-36)',
+                    value: '0-36',
                 },
             ],
         },
@@ -199,14 +205,13 @@ export const route: Route = {
 };
 async function handler(ctx) {
     const includeToday = ctx.req.param('includeToday') ?? 'auto';
-    // Determine if we should include today's events
-    const dates = determineDates(includeToday);
+    const delayHours = parseDelayHours(includeToday);
+    const dates = determineDates(delayHours);
     // Create array of page names for batch request
     const pageNames = dates.map((date) => getCurrentEventsDatePath(date));
-    const cacheKey = 'wikipedia:current-events:rendered:' + pageNames.join('|');
     try {
-        // Single batch request for all pages
-        const contentMap = await cache.tryGet(cacheKey, async () => await fetchMultipleWikiContent(pageNames), config.cache.contentExpire);
+        // Not cached as a whole: the revision lookup must run on every request so an edited day is picked up
+        const contentMap = await fetchMultipleWikiContent(pageNames);
         // Build RSS items from the fetched content
         const items = dates
             .map((date) => {
@@ -221,8 +226,8 @@ async function handler(ctx) {
                         title: `Current events: ${dateStr}`,
                         link: `https://en.wikipedia.org/wiki/${pageName}`,
                         description: html,
-                        // Represent the source calendar date without inventing a publication time.
-                        pubDate: timezone(parseDate(dateStr, 'YYYY-MM-DD', true), 0),
+                        // When the day entered the feed, so a reader can tell how complete its copy was
+                        pubDate: new Date(availableAt(date, delayHours)),
                         guid: `wikipedia-current-events-${dateStr}`,
                     };
                 }
@@ -240,43 +245,46 @@ async function handler(ctx) {
         throw new Error(`Failed to fetch Wikipedia current events: ${message}`, { cause: error });
     }
 }
-function determineDates(includeToday: string) {
-    const now = new Date();
-    const currentHourUTC = now.getUTCHours();
-    let shouldIncludeToday = false;
+const HOUR = 60 * 60 * 1000;
+// A day's page keeps changing until the day ends at GMT-12, 12:00 UTC the next day, i.e. 36 hours after it starts
+const MAX_DELAY_HOURS = 36;
+// Hours after a day's 00:00 UTC before it enters the feed
+function parseDelayHours(includeToday: string): number {
     switch (includeToday) {
         case 'always':
-            shouldIncludeToday = true;
-            break;
+            return 0;
         case 'never':
-            shouldIncludeToday = false;
-            break;
+            return 24;
         case 'auto':
             // Include after 18:00 UTC (6 PM)
-            shouldIncludeToday = currentHourUTC >= 18;
-            break;
+            return 18;
         default: {
             // Anything else is rejected rather than ignored: silently serving the default feed
             // makes a mistyped parameter look like it took effect.
             if (!/^\d+$/.test(includeToday)) {
-                throw new InvalidParameterError(`Invalid includeToday: ${includeToday}. Expected 'auto', 'always', 'never', or a UTC hour 0-23.`);
+                throw new InvalidParameterError(`Invalid includeToday: ${includeToday}. Expected 'auto', 'always', 'never', or a delay in hours 0-${MAX_DELAY_HOURS}.`);
             }
-            // Include after specific hour (0-23). The pattern above already excludes negatives.
-            const targetHour = Number(includeToday);
-            if (targetHour > 23) {
-                throw new InvalidParameterError(`Invalid includeToday hour: ${includeToday}. Expected a UTC hour 0-23.`);
+            // The pattern above already excludes negatives.
+            const delayHours = Number(includeToday);
+            if (delayHours > MAX_DELAY_HOURS) {
+                throw new InvalidParameterError(`Invalid includeToday delay: ${includeToday}. Expected a delay in hours 0-${MAX_DELAY_HOURS}.`);
             }
-            shouldIncludeToday = currentHourUTC >= targetHour;
+            return delayHours;
         }
     }
-    // Create array of dates for the past 7 days, optionally including today
-    const startOffset = shouldIncludeToday ? 0 : 1;
-    const dates = Array.from({ length: 7 }, (_, i) => {
-        const date = new Date(now);
-        date.setUTCDate(date.getUTCDate() - (i + startOffset));
+}
+function availableAt(date: Date, delayHours: number): number {
+    return date.getTime() + delayHours * HOUR;
+}
+// The 7 most recent days whose delay has elapsed, each at 00:00 UTC
+function determineDates(delayHours: number): Date[] {
+    const latest = new Date(Date.now() - delayHours * HOUR);
+    latest.setUTCHours(0, 0, 0, 0);
+    return Array.from({ length: 7 }, (_, i) => {
+        const date = new Date(latest);
+        date.setUTCDate(date.getUTCDate() - i);
         return date;
     });
-    return dates;
 }
 async function unwrapFirstFailure<T>(promise: Promise<T>): Promise<T> {
     try {

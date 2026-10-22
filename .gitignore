@@ -41,3 +41,6 @@ package-lock.json
 # pnpm-lock.yaml
 yarn.lock
 yarn-error.log
+
+# Local-only route tests, not accepted upstream
+*.local.test.ts

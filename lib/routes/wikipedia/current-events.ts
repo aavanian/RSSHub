@@ -22,19 +22,30 @@ function getCurrentEventsDatePath(date: Temporal.PlainDate): string {
 // {{Current events|...|bottom=yes}} call. Neither call nests braces, so [^{}] is enough to bound them.
 const TOP_TEMPLATE = /\{\{\s*Current events\s*\|[^{}]*\btop\s*=\s*yes[^{}]*\}\}/i;
 const BOTTOM_TEMPLATE = /\{\{\s*Current events\s*\|[^{}]*\bbottom\s*=\s*yes[^{}]*\}\}/i;
+// Pages created before 2026-08-01 pass the items as the template's `content=` argument, closed by a
+// trailing }}. Days that far back are only reachable through dateRange, so this arm exists for backfill.
+// The (?=(\s*=))\1 dance around the `=` keeps \s* from overlapping the following [\s\S]*, which would
+// otherwise backtrack super-linearly; see regexp(no-super-linear-backtracking).
+const LEGACY_CONTENT_TEMPLATE = /\{\{Current events\s*\|[\s\S]*?content(?=(\s*=))\1\s*((?:\S[\s\S]*)?)\}\}$/;
 // Simple MediaWiki template parser for {{Current events}} template
 function parseCurrentEventsTemplate(wikitext: string): string | null {
     if (!wikitext) {
         return null;
     }
+    let content: string;
     const top = wikitext.match(TOP_TEMPLATE);
-    if (!top) {
-        return null;
-    }
-    let content = wikitext.slice(top.index! + top[0].length);
-    const bottom = content.match(BOTTOM_TEMPLATE);
-    if (bottom) {
-        content = content.slice(0, bottom.index);
+    if (top) {
+        content = wikitext.slice(top.index! + top[0].length);
+        const bottom = content.match(BOTTOM_TEMPLATE);
+        if (bottom) {
+            content = content.slice(0, bottom.index);
+        }
+    } else {
+        const legacy = wikitext.match(LEGACY_CONTENT_TEMPLATE);
+        if (!legacy) {
+            return null;
+        }
+        content = legacy[2];
     }
     content = content.trim();
     // Strip comments to detect empty content
@@ -83,7 +94,69 @@ async function getRenderedWikiContent(pageName: string, revid: number): Promise<
     });
     return content.text().trim() ? content.html()! : '';
 }
+// A YYYY-MM-DD day, rejecting out-of-range ones such as 2025-02-30
+function parseUTCDay(value: string): Temporal.PlainDate | null {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) {
+        return null;
+    }
+    try {
+        return Temporal.PlainDate.from(value);
+    } catch {
+        return null;
+    }
+}
+export function parseDateRange(dateRange: string): Temporal.PlainDate[] | null {
+    if (!dateRange || typeof dateRange !== 'string') {
+        return null;
+    }
+    const parts = dateRange.split(':');
+    if (parts.length === 1) {
+        const date = parseUTCDay(parts[0]);
+        return date ? [date] : null;
+    }
+    if (parts.length === 2) {
+        const firstDate = parseUTCDay(parts[0]);
+        const secondDate = parseUTCDay(parts[1]);
+        if (!firstDate || !secondDate) {
+            return null;
+        }
+        const [startDate, endDate] = Temporal.PlainDate.compare(firstDate, secondDate) <= 0 ? [firstDate, secondDate] : [secondDate, firstDate];
+        const dates: Temporal.PlainDate[] = [];
+        for (let date = endDate; Temporal.PlainDate.compare(date, startDate) >= 0; date = date.subtract({ days: 1 })) {
+            dates.push(date);
+        }
+        return dates;
+    }
+    return null;
+}
+// The API accepts at most 50 titles per query for unauthenticated clients, and a wide dateRange
+// backfill asks for far more than that.
+const MAX_TITLES_PER_REQUEST = 50;
 async function fetchMultipleWikiContent(pageNames: string[]): Promise<Record<string, string>> {
+    const publishedPages = new Map<string, number>();
+    for (let i = 0; i < pageNames.length; i += MAX_TITLES_PER_REQUEST) {
+        // eslint-disable-next-line no-await-in-loop
+        const batch = await fetchPublishedPages(pageNames.slice(i, i + MAX_TITLES_PER_REQUEST));
+        for (const [pageName, revid] of batch) {
+            publishedPages.set(pageName, revid);
+        }
+    }
+    // Days keep being edited well after they end, so the rendered HTML is keyed by revision: an edit
+    // yields a new key instead of serving a version cached before it.
+    const results = await unwrapFirstFailure(
+        pMap(
+            publishedPages,
+            async ([pageName, revid]) => [pageName, await cache.tryGet(`wikipedia:current-events:article:${pageName}:${revid}`, async () => await getRenderedWikiContent(pageName, revid), config.cache.contentExpire)] as const,
+            {
+                concurrency: 3,
+                stopOnError: false,
+            }
+        )
+    );
+    return Object.fromEntries(results);
+}
+// Returns the pages among pageNames whose wikitext holds at least one item, with their latest revision id.
+async function fetchPublishedPages(pageNames: string[]): Promise<Map<string, number>> {
     const url = 'https://en.wikipedia.org/w/api.php';
     const titles = pageNames.join('|');
     const publishedPages = new Map<string, number>();
@@ -141,28 +214,20 @@ async function fetchMultipleWikiContent(pageNames: string[]): Promise<Record<str
             hasMore = false;
         }
     }
-    // Days keep being edited well after they end, so the rendered HTML is keyed by revision: an edit
-    // yields a new key instead of serving a version cached before it.
-    const results = await unwrapFirstFailure(
-        pMap(
-            publishedPages,
-            async ([pageName, revid]) => [pageName, await cache.tryGet(`wikipedia:current-events:article:${pageName}:${revid}`, async () => await getRenderedWikiContent(pageName, revid), config.cache.contentExpire)] as const,
-            {
-                concurrency: 3,
-                stopOnError: false,
-            }
-        )
-    );
-    return Object.fromEntries(results);
+    return publishedPages;
 }
 export const route: Route = {
-    path: '/current-events/:includeToday?',
+    path: '/current-events/:dateRange?/:includeToday?',
     categories: ['new-media'],
     example: '/wikipedia/current-events',
     parameters: {
+        dateRange: {
+            description: 'Date range in YYYY-MM-DD format. Can be a single date (e.g., "2025-01-15") or a range with colon separator (e.g., "2025-01-15:2025-01-20"). If omitted, defaults to last 7 days behavior.',
+            default: '',
+        },
         includeToday: {
             description:
-                'Hours after a day starts (00:00 UTC) before it enters the feed, also used as its pubDate. A day keeps changing until it ends at GMT-12, 36 hours after it starts, and most readers keep the first version they see.',
+                'Hours after a day starts (00:00 UTC) before it enters the feed, also used as its pubDate. A day keeps changing until it ends at GMT-12, 36 hours after it starts, and most readers keep the first version they see. Applies to dateRange too. Can be given alone, e.g. /current-events/18',
             default: 'auto',
             options: [
                 {
@@ -201,12 +266,29 @@ export const route: Route = {
     name: 'Current Events',
     maintainers: ['aavanian'],
     handler,
-    description: 'Wikipedia Portal: Current events - Latest news and events from the past 7 days',
+    description: 'Wikipedia Portal: Current events - Latest news and events. By default shows the past 7 days, or specify a custom date range.',
 };
 async function handler(ctx) {
-    const includeToday = ctx.req.param('includeToday') ?? 'auto';
+    let dateRangeParam = ctx.req.param('dateRange');
+    let includeToday = ctx.req.param('includeToday') ?? 'auto';
+    // Dates always contain '-' and includeToday values never do, so a lone segment without one,
+    // as in /current-events/18, is the includeToday value
+    if (dateRangeParam && !dateRangeParam.includes('-') && !ctx.req.param('includeToday')) {
+        includeToday = dateRangeParam;
+        dateRangeParam = undefined;
+    }
     const delayHours = parseDelayHours(includeToday);
-    const dates = determineDates(delayHours);
+    let dates: Temporal.PlainDate[];
+    if (dateRangeParam) {
+        const parsedDates = parseDateRange(dateRangeParam);
+        if (!parsedDates) {
+            throw new InvalidParameterError(`Invalid date range format: ${dateRangeParam}. Expected single date (YYYY-MM-DD) or range (YYYY-MM-DD:YYYY-MM-DD)`);
+        }
+        const now = Temporal.Now.instant();
+        dates = parsedDates.filter((date) => Temporal.Instant.compare(availableAt(date, delayHours), now) <= 0);
+    } else {
+        dates = determineDates(delayHours);
+    }
     // Create array of page names for batch request
     const pageNames = dates.map((date) => getCurrentEventsDatePath(date));
     try {

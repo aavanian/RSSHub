@@ -35,6 +35,29 @@ const parseFlightData = (buf: Buffer) => {
     return rows;
 };
 
+// The article body is the element carrying Tailwind's `prose` typography class among its utility
+// classes. The class list also holds prefixed variants such as `prose-a:font-normal`, so the classes
+// are compared one by one.
+const BODY_ELEMENT = /"className":"([^"]*)"[^{}]*"dangerouslySetInnerHTML":\{"__html":/;
+// Either a flight reference such as `$70` or the markup itself, both JSON-encoded
+const JSON_STRING = /"(?:[^"\\]|\\.)*"/;
+
+const findArticleBodyHtml = (rows: Map<string, string>): string | undefined => {
+    for (const row of rows.values()) {
+        const element = BODY_ELEMENT.exec(row);
+        if (!element?.[1].split(/\s+/).includes('prose')) {
+            continue;
+        }
+        const encoded = row.slice(element.index + element[0].length).match(JSON_STRING)?.[0];
+        if (!encoded) {
+            return undefined;
+        }
+        const html = JSON.parse(encoded) as string;
+        return /^\$\w+$/.test(html) ? rows.get(html.slice(1)) : html;
+    }
+    return undefined;
+};
+
 async function handler(ctx: Context) {
     const { tag } = ctx.req.param();
     const limit = getRouteLimit(ctx, 16);
@@ -110,14 +133,11 @@ async function handler(ctx: Context) {
 
                 const rows = parseFlightData(Buffer.from(detailResponse));
 
-                const bodyId = rows
-                    .values()
-                    .find((row) => row.includes('"prose'))
-                    ?.match(/"__html":"\$(\w+)"/)?.[1];
-                if (!bodyId || !rows.has(bodyId)) {
+                const bodyHtml = findArticleBodyHtml(rows);
+                if (!bodyHtml) {
                     throw new Error('No article body found in flight payload');
                 }
-                const $$ = load(rows.get(bodyId)!);
+                const $$ = load(bodyHtml);
 
                 $$('#elevenlabs-audionative-widget').remove();
 
